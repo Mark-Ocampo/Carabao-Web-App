@@ -2,59 +2,55 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
+	"github.com/Mark-Ocampo/carabao-web-app/api/internal/config"
+	"github.com/Mark-Ocampo/carabao-web-app/api/internal/database"
+	"github.com/Mark-Ocampo/carabao-web-app/api/internal/server"
 )
 
 func main() {
-	_ = godotenv.Load()
-
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("DATABASE_URL is not set")
-	}
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	pool, err := pgxpool.New(ctx, dbURL)
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("cannot create pool: %v", err)
+		log.Fatalf("config: %v", err)
+	}
+
+	pool, err := database.Connect(context.Background(), cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("database: %v", err)
 	}
 	defer pool.Close()
-
-	if err := pool.Ping(ctx); err != nil {
-		log.Fatalf("cannot reach database: %v", err)
-	}
 	log.Println("connected to PostgreSQL")
 
-	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           server.New(pool, cfg),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
-	r.Get("/health", func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if err := pool.Ping(req.Context()); err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{"status": "db down"})
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
+	// Stop cleanly on Ctrl+C
+	go func() {
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+		<-stop
 
-	log.Printf("API listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, r))
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	log.Printf("API listening on :%s", cfg.Port)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("server: %v", err)
+	}
+	log.Println("server stopped")
 }
